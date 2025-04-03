@@ -1,0 +1,126 @@
+name: Build and Deploy to Azure Container Apps
+
+on:
+  push:
+    tags:
+      - "*"
+
+env:
+  AZURE_REGION: centralindia
+  RESOURCE_GROUP: Holmium
+  CONTAINER_APPS_ENVIRONMENT: holmium-env
+  LOG_ANALYTICS_WORKSPACE: holmium-law
+  AZURE_CONTAINER_REGISTRY: holmium1si22cs402.azurecr.io
+  APP_NAME: holmium
+  CONTAINER_APP_NAME: holmium
+  TARGET_PORT: 3000
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Extract tag name
+        id: extract_tag
+        run: echo "TAG_NAME=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_GITHUB_ATIONS }}
+
+      - name: Ensure Resource Group exists
+        run: |
+          if ! az group show --name ${{ env.RESOURCE_GROUP }} > /dev/null 2>&1; then
+            az group create --name ${{ env.RESOURCE_GROUP }} --location ${{ env.AZURE_REGION }}
+          fi
+
+      - name: Ensure Log Analytics Workspace exists
+        run: |
+          if ! az monitor log-analytics workspace show --resource-group ${{ env.RESOURCE_GROUP }} --workspace-name ${{ env.LOG_ANALYTICS_WORKSPACE }} > /dev/null 2>&1; then
+            az monitor log-analytics workspace create \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --workspace-name ${{ env.LOG_ANALYTICS_WORKSPACE }} \
+              --location ${{ env.AZURE_REGION }}
+          fi
+
+      - name: Retrieve Log Analytics Workspace credentials
+        run: |
+          WORKSPACE_ID=$(az monitor log-analytics workspace show \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --workspace-name ${{ env.LOG_ANALYTICS_WORKSPACE }} \
+            --query customerId --output tsv)
+          WORKSPACE_KEY=$(az monitor log-analytics workspace get-shared-keys \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --workspace-name ${{ env.LOG_ANALYTICS_WORKSPACE }} \
+            --query primarySharedKey --output tsv)
+          echo "::add-mask::$WORKSPACE_ID"
+          echo "::add-mask::$WORKSPACE_KEY"
+          echo "WORKSPACE_ID=$WORKSPACE_ID" >> $GITHUB_ENV
+          echo "WORKSPACE_KEY=$WORKSPACE_KEY" >> $GITHUB_ENV
+
+      - name: Ensure Azure Container Registry exists
+        run: |
+          REGISTRY_NAME=$(echo "${{ env.AZURE_CONTAINER_REGISTRY }}" | cut -d'.' -f1)
+          if ! az acr show --name $REGISTRY_NAME --resource-group ${{ env.RESOURCE_GROUP }} > /dev/null 2>&1; then
+            az acr create \
+              --name $REGISTRY_NAME \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --sku Standard \
+              --admin-enabled true
+          fi
+          ACR_USERNAME=$(az acr credential show --name $REGISTRY_NAME --query username -o tsv)
+          ACR_PASSWORD=$(az acr credential show --name $REGISTRY_NAME --query passwords[0].value -o tsv)
+          echo "::add-mask::$ACR_USERNAME"
+          echo "::add-mask::$ACR_PASSWORD"
+          echo "ACR_USERNAME=$ACR_USERNAME" >> $GITHUB_ENV
+          echo "ACR_PASSWORD=$ACR_PASSWORD" >> $GITHUB_ENV
+
+      - name: Ensure Container Apps Environment exists with Log Analytics
+        run: |
+          if ! az containerapp env show --name ${{ env.CONTAINER_APPS_ENVIRONMENT }} --resource-group ${{ env.RESOURCE_GROUP }} > /dev/null 2>&1; then
+            az containerapp env create \
+              --name ${{ env.CONTAINER_APPS_ENVIRONMENT }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --location ${{ env.AZURE_REGION }} \
+              --logs-workspace-id $WORKSPACE_ID \
+              --logs-workspace-key $WORKSPACE_KEY
+          fi
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.AZURE_CONTAINER_REGISTRY }}
+          username: ${{ env.ACR_USERNAME }}
+          password: ${{ env.ACR_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6.15.0
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.APP_NAME }}:${{ env.TAG_NAME }}
+
+      - name: Deploy to Azure Container App
+        run: |
+          if ! az containerapp show --name ${{ env.CONTAINER_APP_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} > /dev/null 2>&1; then
+            az containerapp create \
+              --name ${{ env.CONTAINER_APP_NAME }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --environment ${{ env.CONTAINER_APPS_ENVIRONMENT }} \
+              --image ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.APP_NAME }}:${{ env.TAG_NAME }} \
+              --ingress external \
+              --target-port ${{ env.TARGET_PORT}}
+          else
+            az containerapp update \
+              --name ${{ env.CONTAINER_APP_NAME }} \
+              --resource-group ${{ env.RESOURCE_GROUP }} \
+              --image ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.APP_NAME }}:${{ env.TAG_NAME }}
+          fi
