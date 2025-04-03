@@ -118,7 +118,7 @@ jobs:
               --environment ${{ env.CONTAINER_APPS_ENVIRONMENT }} \
               --ingress external \
               --target-port ${{ env.TARGET_PORT }} \
-              --image nginx  # Temporary image to bypass ACR auth
+              --image nginx  # Temporary image to bypass ACR auth \
               --system-assigned true
           fi
 
