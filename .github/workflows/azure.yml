@@ -119,6 +119,7 @@ jobs:
               --ingress external \
               --target-port ${{ env.TARGET_PORT }} \
               --image nginx  # Temporary image to bypass ACR auth
+              --system-assigned true
           fi
 
       - name: Assign AcrPull to Container App's managed identity
