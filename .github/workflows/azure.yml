@@ -11,6 +11,7 @@ env:
   CONTAINER_APPS_ENVIRONMENT: holmium-env
   LOG_ANALYTICS_WORKSPACE: holmium-law
   AZURE_CONTAINER_REGISTRY: holmium1si22cs402.azurecr.io
+  REPOSITORY_NAME: holmium
   APP_NAME: holmium
   CONTAINER_APP_NAME: holmium
   TARGET_PORT: 3000
@@ -30,13 +31,12 @@ jobs:
       - name: Azure Login
         uses: azure/login@v2
         with:
-          creds: ${{ secrets.AZURE_GITHUB_ATIONS }}
+          creds: ${{ secrets.AZURE_GITHUB_ACTIONS }}
 
       - name: Ensure Resource Group exists
         run: |
-          if ! az group show --name ${{ env.RESOURCE_GROUP }} > /dev/null 2>&1; then
-            az group create --name ${{ env.RESOURCE_GROUP }} --location ${{ env.AZURE_REGION }}
-          fi
+          az group show --name ${{ env.RESOURCE_GROUP }} || \
+          az group create --name ${{ env.RESOURCE_GROUP }} --location ${{ env.AZURE_REGION }}
 
       - name: Ensure Log Analytics Workspace exists
         run: |
@@ -79,7 +79,7 @@ jobs:
           echo "ACR_USERNAME=$ACR_USERNAME" >> $GITHUB_ENV
           echo "ACR_PASSWORD=$ACR_PASSWORD" >> $GITHUB_ENV
 
-      - name: Ensure Container Apps Environment exists with Log Analytics
+      - name: Ensure Container Apps Environment exists
         run: |
           if ! az containerapp env show --name ${{ env.CONTAINER_APPS_ENVIRONMENT }} --resource-group ${{ env.RESOURCE_GROUP }} > /dev/null 2>&1; then
             az containerapp env create \
@@ -106,21 +106,36 @@ jobs:
           context: .
           file: ./Dockerfile
           push: true
-          tags: ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.APP_NAME }}:${{ env.TAG_NAME }}
+          tags: ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.REPOSITORY_NAME }}:${{ env.TAG_NAME }}
 
-      - name: Deploy to Azure Container App
+      - name: Create empty Container App (for identity provisioning)
+        if: ${{ !cancelled() }}
         run: |
           if ! az containerapp show --name ${{ env.CONTAINER_APP_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} > /dev/null 2>&1; then
             az containerapp create \
               --name ${{ env.CONTAINER_APP_NAME }} \
               --resource-group ${{ env.RESOURCE_GROUP }} \
               --environment ${{ env.CONTAINER_APPS_ENVIRONMENT }} \
-              --image ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.APP_NAME }}:${{ env.TAG_NAME }} \
               --ingress external \
-              --target-port ${{ env.TARGET_PORT}}
-          else
-            az containerapp update \
-              --name ${{ env.CONTAINER_APP_NAME }} \
-              --resource-group ${{ env.RESOURCE_GROUP }} \
-              --image ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.APP_NAME }}:${{ env.TAG_NAME }}
+              --target-port ${{ env.TARGET_PORT }} \
+              --image nginx  # Temporary image to bypass ACR auth
           fi
+
+      - name: Assign AcrPull to Container App's managed identity
+        run: |
+          REGISTRY_NAME=$(echo "${{ env.AZURE_CONTAINER_REGISTRY }}" | cut -d'.' -f1)
+          PRINCIPAL_ID=$(az containerapp show \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --query identity.principalId --output tsv)
+          az role assignment create \
+            --assignee "$PRINCIPAL_ID" \
+            --role "AcrPull" \
+            --scope /subscriptions/${{ secrets.SUBSCRIPTION_ID }}/resourceGroups/${{ env.RESOURCE_GROUP }}/providers/Microsoft.ContainerRegistry/registries/$REGISTRY_NAME
+
+      - name: Update Container App with real image
+        run: |
+          az containerapp update \
+            --name ${{ env.CONTAINER_APP_NAME }} \
+            --resource-group ${{ env.RESOURCE_GROUP }} \
+            --image ${{ env.AZURE_CONTAINER_REGISTRY }}/${{ env.REPOSITORY_NAME }}:${{ env.TAG_NAME }}
